@@ -1,3 +1,4 @@
+// src/components/Dashboard.js
 import React, { useEffect, useState } from "react";
 import {
   collection,
@@ -8,6 +9,7 @@ import {
   serverTimestamp,
   writeBatch,
   doc,
+  updateDoc,
 } from "firebase/firestore";
 import { db } from "../firebase";
 import { DragDropContext, Droppable } from "@hello-pangea/dnd";
@@ -15,7 +17,7 @@ import ListColumn from "./ListColumn";
 
 export default function Dashboard({ user }) {
   const [lists, setLists] = useState([]);
-  const [tasks, setTasks] = useState([]);
+  const [tasks, setTasks] = useState({}); // Use object mapping listId => tasks array
 
   const priorityColors = {
     1: "bg-red-200 text-red-800", // High
@@ -36,7 +38,7 @@ export default function Dashboard({ user }) {
     return unsub;
   }, [user?.uid]);
 
-  // Subscribe to tasks for each list
+  // Subscribe to tasks per list
   useEffect(() => {
     if (!user?.uid || lists.length === 0) return;
 
@@ -45,10 +47,19 @@ export default function Dashboard({ user }) {
       const q = query(tasksRef, orderBy("order", "asc"));
 
       return onSnapshot(q, (snap) => {
-        setTasks((prev) => [
-          ...prev.filter((t) => t.listId !== list.id),
-          ...snap.docs.map((d) => ({ id: d.id, listId: list.id, ...d.data() })),
-        ]);
+        const newTasks = snap.docs.map((d) => ({
+          id: d.id,
+          listId: list.id,
+          ...d.data(),
+        }));
+
+        // Deduplicate tasks per list
+        const uniqueTasks = Array.from(new Map(newTasks.map((t) => [t.id, t])).values());
+
+        setTasks((prev) => ({
+          ...prev,
+          [list.id]: uniqueTasks,
+        }));
       });
     });
 
@@ -68,19 +79,18 @@ export default function Dashboard({ user }) {
 
   // Add new task
   const addTask = async (listId, taskData) => {
-    const tasksInList = tasks.filter((t) => t.listId === listId);
-    const priority = taskData.priority ?? 3; // default Low
+    const tasksInList = tasks[listId] || [];
 
     await addDoc(collection(db, "users", user.uid, "lists", listId, "tasks"), {
       ...taskData,
-      priority,
       order: tasksInList.length,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
 
-    const listRef = doc(db, "users", user.uid, "lists", listId);
-    await writeBatch(db).set(listRef, { updatedAt: serverTimestamp() }, { merge: true });
+    await updateDoc(doc(db, "users", user.uid, "lists", listId), {
+      updatedAt: serverTimestamp(),
+    });
   };
 
   // Handle drag & drop
@@ -88,53 +98,67 @@ export default function Dashboard({ user }) {
     const { destination, source, draggableId } = result;
     if (!destination) return;
 
-    const movedTask = tasks.find((t) => t.id === draggableId);
+    const sourceTasks = tasks[source.droppableId.replace("list-", "")] || [];
+    const movedTask = sourceTasks.find((t) => t.id === draggableId);
     if (!movedTask) return;
 
     const batch = writeBatch(db);
 
-    // --- Priority drop ---
+    // --- Handle priority drop ---
     if (destination.droppableId.startsWith("priority-")) {
       const [, listId, priorityLabel] = destination.droppableId.split("-");
       const taskRef = doc(db, "users", user.uid, "lists", listId, "tasks", movedTask.id);
-      const priority = priorityLabel === "High" ? 1 : priorityLabel === "Medium" ? 2 : 3;
 
-      batch.set(taskRef, { priority, updatedAt: serverTimestamp() }, { merge: true });
+      const priority = priorityLabel === "High" ? 1 : priorityLabel === "Medium" ? 2 : 3;
+      batch.update(taskRef, { priority, updatedAt: serverTimestamp() });
       await batch.commit();
       return;
     }
 
-    // --- Moving tasks within/between lists ---
+    // --- Handle moving between lists ---
     const sourceListId = source.droppableId.replace("list-", "");
     const destListId = destination.droppableId.replace("list-", "");
 
-    const sourceTasks = tasks.filter((t) => t.listId === sourceListId).sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
-    const destTasks = tasks.filter((t) => t.listId === destListId).sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+    const newSourceTasks = [...sourceTasks];
+    newSourceTasks.splice(source.index, 1);
 
-    // Remove from source
-    const indexInSource = sourceTasks.findIndex((t) => t.id === draggableId);
-    if (indexInSource !== -1) sourceTasks.splice(indexInSource, 1);
-
-    // Add to destination
+    const destTasks = tasks[destListId] ? [...tasks[destListId]] : [];
     destTasks.splice(destination.index, 0, movedTask);
 
-    // Update orders in destination
-    destTasks.forEach((t, idx) => {
-      const ref = doc(db, "users", user.uid, "lists", destListId, "tasks", t.id);
-      batch.set(ref, { ...t, order: idx, listId: destListId, updatedAt: serverTimestamp() }, { merge: true });
-    });
+    // Update state immediately to avoid duplicate render
+    setTasks((prev) => ({
+      ...prev,
+      [sourceListId]: newSourceTasks,
+      [destListId]: destTasks,
+    }));
 
-    // Update orders in source (if different list)
-    if (sourceListId !== destListId) {
-      sourceTasks.forEach((t, idx) => {
+    // Update Firestore
+    if (sourceListId === destListId) {
+      destTasks.forEach((t, idx) => {
+        const ref = doc(db, "users", user.uid, "lists", destListId, "tasks", t.id);
+        if ((t.order ?? 0) !== idx) batch.update(ref, { order: idx, updatedAt: serverTimestamp() });
+      });
+    } else {
+      // Remove from old list
+      const oldRef = doc(db, "users", user.uid, "lists", sourceListId, "tasks", movedTask.id);
+      batch.delete(oldRef);
+
+      // Add to new list
+      const newRef = doc(db, "users", user.uid, "lists", destListId, "tasks", movedTask.id);
+      batch.set(newRef, { ...movedTask, listId: destListId, updatedAt: serverTimestamp() }, { merge: true });
+
+      // Update order in destination
+      destTasks.forEach((t, idx) => {
+        const ref = doc(db, "users", user.uid, "lists", destListId, "tasks", t.id);
+        batch.update(ref, { order: idx, updatedAt: serverTimestamp() });
+      });
+
+      // Update order in source
+      newSourceTasks.forEach((t, idx) => {
         const ref = doc(db, "users", user.uid, "lists", sourceListId, "tasks", t.id);
-        batch.set(ref, { ...t, order: idx, updatedAt: serverTimestamp() }, { merge: true });
+        batch.update(ref, { order: idx, updatedAt: serverTimestamp() });
       });
     }
-
-    // Update lists timestamp
-    batch.set(doc(db, "users", user.uid, "lists", sourceListId), { updatedAt: serverTimestamp() }, { merge: true });
-    batch.set(doc(db, "users", user.uid, "lists", destListId), { updatedAt: serverTimestamp() }, { merge: true });
 
     await batch.commit();
   };
@@ -153,20 +177,21 @@ export default function Dashboard({ user }) {
       <DragDropContext onDragEnd={onDragEnd}>
         <div className="flex gap-6 overflow-x-auto pb-6">
           {lists.map((list) => {
-            const listTasks = tasks
-              .filter((t) => t.listId === list.id)
-              .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+            const listTasks = tasks[list.id] ? [...tasks[list.id]] : [];
+            listTasks.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
 
             return (
               <div key={list.id} className="bg-white rounded-xl shadow-md p-5 w-80 flex-shrink-0">
                 <ListColumn list={list} tasks={listTasks} onAddTask={addTask} />
 
-                {/* Priority Drop Zones */}
                 <div className="mt-4">
                   <h3 className="text-sm font-semibold mb-2">Change Task Priority (Drop here)</h3>
                   <div className="flex flex-col gap-3">
                     {["High", "Medium", "Low"].map((level, idx) => (
-                      <Droppable droppableId={`priority-${list.id}-${level}`} key={`${list.id}-${level}`}>
+                      <Droppable
+                        droppableId={`priority-${list.id}-${level}`}
+                        key={`${list.id}-${level}`}
+                      >
                         {(provided, snapshot) => (
                           <div
                             ref={provided.innerRef}
